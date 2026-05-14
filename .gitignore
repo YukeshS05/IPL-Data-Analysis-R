@@ -1,0 +1,12 @@
+# R specific
+.RData
+.Rhistory
+.Rproj.user/
+
+# Large files
+data/deliveries.csv
+data/deliveries_clean.csv
+
+# Temp files
+*.tmp
+~$*

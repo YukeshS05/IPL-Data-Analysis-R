@@ -1,0 +1,635 @@
+---
+title: "IPL Data Analysis & Match Outcome Prediction"
+author: "Yukesh"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    theme: flatly
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    number_sections: true
+    highlight: tango
+    fig_width: 10
+    fig_height: 6
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo    = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  fig.align = "center"
+)
+```
+
+---
+
+# Introduction
+
+## Project Overview
+
+The Indian Premier League (IPL) is the world's most popular Twenty20
+cricket league, played annually in India since 2008. This project
+performs a comprehensive data analysis of IPL matches from 2008 to
+2024 and builds machine learning models to predict match outcomes.
+
+## Objectives
+
+The key objectives of this project are:
+
+- Explore and visualize IPL match data across 17 seasons
+- Identify key patterns in team performance, toss decisions,
+  and venue statistics
+- Engineer meaningful features from raw match data
+- Build and compare three machine learning models to predict
+  which team wins a match
+- Evaluate model performance and identify the most important
+  predictive features
+
+## Dataset Description
+
+Two datasets were used from Kaggle's IPL Complete Dataset:
+
+- **matches.csv** — 1,095 rows, one per match, covering season,
+  teams, toss, venue, and result
+- **deliveries.csv** — 260,920 rows, one per ball bowled, covering
+  batsman, bowler, runs, and dismissals
+
+---
+
+# Setup & Libraries
+
+```{r libraries}
+library(tidyverse)
+library(ggplot2)
+library(dplyr)
+library(readr)
+library(caret)
+library(rpart)
+library(rpart.plot)
+library(randomForest)
+library(corrplot)
+library(pROC)
+```
+
+---
+
+# Data Loading & Exploration
+
+```{r load-data}
+matches    <- read_csv("../data/matches_clean.csv")
+deliveries <- read_csv("../data/deliveries_clean.csv")
+
+cat("Matches loaded   :", nrow(matches), "rows,", ncol(matches), "cols\n")
+cat("Deliveries loaded:", nrow(deliveries), "rows,", ncol(deliveries), "cols\n")
+```
+
+## Dataset Structure
+
+```{r structure}
+glimpse(matches)
+```
+
+## Missing Values
+
+```{r missing}
+cat("Missing values in matches:\n")
+colSums(is.na(matches))
+```
+
+---
+
+# Data Cleaning
+
+The following cleaning steps were applied to the raw data:
+
+1. **Season format** standardized from mixed formats to 4-digit year
+2. **Team names** unified — 4 inconsistencies fixed
+   (e.g. Kings XI Punjab → Punjab Kings)
+3. **No-result matches** removed (5 matches with no winner)
+4. **Missing cities** filled from venue names
+5. **Irrelevant columns** dropped (method, umpire1, umpire2)
+6. **Over numbering** corrected from 0–19 to 1–20
+7. **Toss impact column** added
+
+```{r cleaning-summary}
+cat("Final cleaned dataset dimensions:\n")
+cat("Matches   :", nrow(matches), "rows,", ncol(matches), "cols\n")
+cat("Deliveries:", nrow(deliveries), "rows,", ncol(deliveries), "cols\n")
+```
+
+---
+
+# Exploratory Data Analysis
+
+## Most Successful Teams
+
+```{r chart1-team-wins, fig.cap="Total IPL wins by each team across all seasons"}
+team_wins <- matches %>%
+  group_by(winner) %>%
+  summarise(wins = n()) %>%
+  arrange(desc(wins))
+
+ggplot(team_wins, aes(x = reorder(winner, wins), y = wins, fill = wins)) +
+  geom_col() +
+  coord_flip() +
+  scale_fill_gradient(low = "#56B4E9", high = "#E69F00") +
+  labs(
+    title = "Total IPL Wins by Team (2008–2024)",
+    x = "Team", y = "Number of Wins"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(legend.position = "none")
+```
+
+**Key Finding:** Mumbai Indians lead with 144 wins, followed closely
+by Chennai Super Kings (138) and Kolkata Knight Riders (131).
+These three teams form the "Big Three" of IPL.
+
+## Toss Decision Trend
+
+```{r chart2-toss-trend, fig.cap="How toss decisions have changed across IPL seasons"}
+toss_trend <- matches %>%
+  group_by(season, toss_decision) %>%
+  summarise(count = n(), .groups = "drop")
+
+ggplot(toss_trend,
+       aes(x = season, y = count,
+           color = toss_decision, group = toss_decision)) +
+  geom_line(linewidth = 1.2) +
+  geom_point(size = 3) +
+  scale_color_manual(values = c("bat" = "#E69F00", "field" = "#0072B2")) +
+  labs(
+    title  = "Toss Decision Trend Across IPL Seasons",
+    x = "Season", y = "Number of Matches", color = "Toss Decision"
+  ) +
+  theme_minimal(base_size = 13)
+```
+
+**Key Finding:** Teams consistently prefer fielding first — 704
+matches (64%) vs batting first (391 matches, 36%). This reflects
+T20 cricket's chase-friendly nature.
+
+## Does Toss Winning Help?
+
+```{r chart3-toss-impact, fig.cap="Relationship between winning the toss and winning the match"}
+toss_impact <- matches %>%
+  group_by(toss_winner_won) %>%
+  summarise(count = n()) %>%
+  mutate(percentage = round(count / sum(count) * 100, 1))
+
+ggplot(toss_impact,
+       aes(x = toss_winner_won, y = count, fill = toss_winner_won)) +
+  geom_col(width = 0.5) +
+  geom_text(aes(label = paste0(percentage, "%")),
+            vjust = -0.5, size = 5, fontface = "bold") +
+  scale_fill_manual(values = c("Yes" = "#009E73", "No" = "#D55E00")) +
+  labs(
+    title = "Does Winning the Toss Lead to Winning the Match?",
+    x = "Toss Winner Also Won?", y = "Number of Matches"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(legend.position = "none")
+```
+
+**Key Finding:** Toss winners win only 50.8% of the time — barely
+above a coin flip. This confirms that the toss has minimal impact
+on match outcomes in modern IPL cricket.
+
+## Batting First vs Chasing
+
+```{r chart4-bat-chase, fig.cap="Distribution of wins by batting first versus chasing"}
+win_type <- matches %>%
+  filter(result %in% c("runs", "wickets")) %>%
+  group_by(result) %>%
+  summarise(count = n()) %>%
+  mutate(
+    label      = ifelse(result == "runs",
+                        "Won Batting First", "Won Chasing"),
+    percentage = round(count / sum(count) * 100, 1)
+  )
+
+ggplot(win_type, aes(x = "", y = count, fill = label)) +
+  geom_col(width = 1) +
+  coord_polar(theta = "y") +
+  geom_text(aes(label = paste0(label, "\n", percentage, "%")),
+            position = position_stack(vjust = 0.5),
+            size = 5, fontface = "bold") +
+  scale_fill_manual(
+    values = c("Won Batting First" = "#E69F00",
+               "Won Chasing"       = "#56B4E9")) +
+  labs(title = "IPL Matches: Batting First vs Chasing Wins") +
+  theme_void(base_size = 13) +
+  theme(legend.position = "none")
+```
+
+## Top 10 Run Scorers
+
+```{r chart5-batsmen, fig.cap="All-time top 10 run scorers in IPL history"}
+top_batsmen <- deliveries %>%
+  group_by(batter) %>%
+  summarise(total_runs = sum(batsman_runs)) %>%
+  arrange(desc(total_runs)) %>%
+  slice(1:10)
+
+ggplot(top_batsmen,
+       aes(x = reorder(batter, total_runs),
+           y = total_runs, fill = total_runs)) +
+  geom_col() +
+  coord_flip() +
+  geom_text(aes(label = total_runs),
+            hjust = -0.1, size = 4, fontface = "bold") +
+  scale_fill_gradient(low = "#56B4E9", high = "#D55E00") +
+  labs(
+    title = "Top 10 Run Scorers in IPL History",
+    x = "Batsman", y = "Total Runs"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(legend.position = "none") +
+  ylim(0, max(top_batsmen$total_runs) * 1.1)
+```
+
+**Key Finding:** Virat Kohli leads with 8,014 runs — 1,245 runs
+ahead of second-placed Shikhar Dhawan (6,769).
+
+## Top 10 Wicket Takers
+
+```{r chart6-bowlers, fig.cap="All-time top 10 wicket takers in IPL history"}
+top_bowlers <- deliveries %>%
+  filter(is_wicket == 1) %>%
+  filter(!dismissal_kind %in%
+           c("run out", "retired hurt", "obstructing the field")) %>%
+  group_by(bowler) %>%
+  summarise(wickets = n()) %>%
+  arrange(desc(wickets)) %>%
+  slice(1:10)
+
+ggplot(top_bowlers,
+       aes(x = reorder(bowler, wickets),
+           y = wickets, fill = wickets)) +
+  geom_col() +
+  coord_flip() +
+  geom_text(aes(label = wickets),
+            hjust = -0.1, size = 4, fontface = "bold") +
+  scale_fill_gradient(low = "#56B4E9", high = "#009E73") +
+  labs(
+    title = "Top 10 Wicket Takers in IPL History",
+    x = "Bowler", y = "Total Wickets"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(legend.position = "none") +
+  ylim(0, max(top_bowlers$wickets) * 1.1)
+```
+
+**Key Finding:** Yuzvendra Chahal leads with 205 wickets,
+confirming that leg-spin bowling dominates T20 cricket.
+
+## Matches Per Season
+
+```{r chart7-seasons, fig.cap="Growth of IPL season size over the years"}
+season_matches <- matches %>%
+  group_by(season) %>%
+  summarise(total_matches = n())
+
+ggplot(season_matches,
+       aes(x = factor(season), y = total_matches, fill = total_matches)) +
+  geom_col() +
+  geom_text(aes(label = total_matches),
+            vjust = -0.4, size = 4, fontface = "bold") +
+  scale_fill_gradient(low = "#56B4E9", high = "#E69F00") +
+  labs(
+    title = "Number of IPL Matches Played Per Season",
+    x = "Season", y = "Total Matches"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    legend.position = "none"
+  )
+```
+
+## Top 10 Venues
+
+```{r chart8-venues, fig.cap="Most frequently used IPL venues"}
+top_venues <- matches %>%
+  group_by(venue) %>%
+  summarise(matches_hosted = n()) %>%
+  arrange(desc(matches_hosted)) %>%
+  slice(1:10)
+
+ggplot(top_venues,
+       aes(x = reorder(venue, matches_hosted),
+           y = matches_hosted, fill = matches_hosted)) +
+  geom_col() +
+  coord_flip() +
+  geom_text(aes(label = matches_hosted),
+            hjust = -0.1, size = 4, fontface = "bold") +
+  scale_fill_gradient(low = "#56B4E9", high = "#CC79A7") +
+  labs(
+    title = "Top 10 IPL Venues by Matches Hosted",
+    x = "Venue", y = "Matches Hosted"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "none") +
+  ylim(0, max(top_venues$matches_hosted) * 1.15)
+```
+
+**Key Finding:** Eden Gardens, Kolkata has hosted the most IPL
+matches (77), followed by Wankhede Stadium, Mumbai (74).
+
+---
+
+# Feature Engineering
+
+Eleven features were engineered from the raw data for the
+prediction model:
+
+```{r feature-engineering}
+# Rebuild all features
+team_win_rate <- matches %>%
+  pivot_longer(cols = c(team1, team2),
+               names_to = "role", values_to = "team") %>%
+  group_by(team) %>%
+  summarise(
+    total_matches = n(),
+    total_wins    = sum(winner == team),
+    win_rate      = round(total_wins / total_matches, 3)
+  ) %>%
+  arrange(desc(win_rate))
+
+cat("Team Win Rates:\n")
+print(team_win_rate)
+```
+
+```{r build-model-data}
+all_teams     <- sort(unique(c(matches$team1, matches$team2)))
+team_encoding <- setNames(1:length(all_teams), all_teams)
+venue_counts  <- matches %>%
+  group_by(venue) %>%
+  summarise(venue_match_count = n())
+
+model_features <- read_csv("../data/model_features.csv") %>%
+  mutate(team1_wins = factor(team1_wins,
+                             levels = c("Team2_Wins", "Team1_Wins")))
+
+cat("\nModel features shape:",
+    nrow(model_features), "rows,",
+    ncol(model_features), "cols\n")
+
+cat("\nTarget variable distribution:\n")
+print(round(prop.table(table(model_features$team1_wins)) * 100, 1))
+```
+
+---
+
+# Machine Learning Models
+
+## Train-Test Split
+
+```{r split}
+set.seed(42)
+train_index <- createDataPartition(model_features$team1_wins,
+                                   p = 0.80, list = FALSE)
+train_data  <- model_features[ train_index, ]
+test_data   <- model_features[-train_index, ]
+
+cat("Training rows:", nrow(train_data), "\n")
+cat("Testing rows :", nrow(test_data),  "\n")
+```
+
+## Cross Validation Setup
+
+```{r cv-setup}
+train_control <- trainControl(
+  method          = "cv",
+  number          = 10,
+  savePredictions = TRUE,
+  classProbs      = TRUE,
+  summaryFunction = twoClassSummary
+)
+```
+
+## Model 1 — Logistic Regression
+
+```{r model-lr}
+set.seed(42)
+model_lr <- train(
+  team1_wins ~ ., data = train_data,
+  method = "glm", family = "binomial",
+  trControl = train_control, metric = "ROC"
+)
+pred_lr <- predict(model_lr, newdata = test_data)
+cm_lr   <- confusionMatrix(pred_lr, test_data$team1_wins,
+                            positive = "Team1_Wins")
+acc_lr  <- round(cm_lr$overall["Accuracy"] * 100, 2)
+cat("Logistic Regression Accuracy:", acc_lr, "%\n")
+```
+
+## Model 2 — Decision Tree
+
+```{r model-dt}
+set.seed(42)
+model_dt <- train(
+  team1_wins ~ ., data = train_data,
+  method = "rpart", trControl = train_control,
+  metric = "ROC", tuneLength = 10
+)
+pred_dt <- predict(model_dt, newdata = test_data)
+cm_dt   <- confusionMatrix(pred_dt, test_data$team1_wins,
+                            positive = "Team1_Wins")
+acc_dt  <- round(cm_dt$overall["Accuracy"] * 100, 2)
+cat("Decision Tree Accuracy:", acc_dt, "%\n")
+```
+
+```{r decision-tree-plot, fig.cap="Decision Tree structure for IPL match prediction"}
+rpart.plot(
+  model_dt$finalModel,
+  type          = 4,
+  extra         = 108,
+  box.palette   = "RdYlGn",
+  shadow.col    = "gray80",
+  fallen.leaves = TRUE,
+  main          = "IPL Match Outcome — Decision Tree"
+)
+```
+
+## Model 3 — Random Forest
+
+```{r model-rf}
+set.seed(42)
+model_rf <- train(
+  team1_wins ~ ., data = train_data,
+  method = "rf", trControl = train_control,
+  metric = "ROC", tuneLength = 5, ntree = 500
+)
+pred_rf <- predict(model_rf, newdata = test_data)
+cm_rf   <- confusionMatrix(pred_rf, test_data$team1_wins,
+                            positive = "Team1_Wins")
+acc_rf  <- round(cm_rf$overall["Accuracy"] * 100, 2)
+cat("Random Forest Accuracy:", acc_rf, "%\n")
+```
+
+---
+
+# Model Evaluation
+
+## Accuracy Comparison
+
+```{r model-comparison, fig.cap="Accuracy comparison across all three models"}
+model_comparison <- data.frame(
+  Model    = c("Logistic Regression", "Decision Tree", "Random Forest"),
+  Accuracy = c(acc_lr, acc_dt, acc_rf),
+  Sensitivity = c(
+    round(cm_lr$byClass["Sensitivity"] * 100, 2),
+    round(cm_dt$byClass["Sensitivity"] * 100, 2),
+    round(cm_rf$byClass["Sensitivity"] * 100, 2)
+  ),
+  Specificity = c(
+    round(cm_lr$byClass["Specificity"] * 100, 2),
+    round(cm_dt$byClass["Specificity"] * 100, 2),
+    round(cm_rf$byClass["Specificity"] * 100, 2)
+  )
+)
+
+print(model_comparison)
+
+ggplot(model_comparison,
+       aes(x = reorder(Model, Accuracy),
+           y = Accuracy, fill = Model)) +
+  geom_col(width = 0.5) +
+  geom_text(aes(label = paste0(Accuracy, "%")),
+            vjust = -0.5, size = 5, fontface = "bold") +
+  scale_fill_manual(values = c(
+    "Logistic Regression" = "#0072B2",
+    "Decision Tree"       = "#E69F00",
+    "Random Forest"       = "#009E73"
+  )) +
+  labs(
+    title = "Model Accuracy Comparison",
+    x = "Model", y = "Accuracy (%)"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(legend.position = "none") +
+  ylim(0, 100)
+```
+
+## Feature Importance
+
+```{r feature-importance, fig.cap="Most important features according to Random Forest"}
+importance_df <- varImp(model_rf)$importance %>%
+  as.data.frame() %>%
+  rownames_to_column("feature") %>%
+  arrange(desc(Overall))
+
+ggplot(importance_df,
+       aes(x = reorder(feature, Overall),
+           y = Overall, fill = Overall)) +
+  geom_col() +
+  coord_flip() +
+  scale_fill_gradient(low = "#56B4E9", high = "#E69F00") +
+  geom_text(aes(label = round(Overall, 1)),
+            hjust = -0.1, size = 4, fontface = "bold") +
+  labs(
+    title = "Feature Importance — Random Forest",
+    x = "Feature", y = "Importance Score"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(legend.position = "none") +
+  ylim(0, max(importance_df$Overall) * 1.15)
+```
+
+## ROC Curve
+
+```{r roc-curve, fig.cap="ROC Curve for Random Forest model"}
+library(pROC)
+pred_rf_prob <- predict(model_rf, newdata = test_data, type = "prob")
+roc_rf <- roc(
+  response  = test_data$team1_wins,
+  predictor = pred_rf_prob[, "Team1_Wins"],
+  levels    = c("Team2_Wins", "Team1_Wins")
+)
+plot(roc_rf,
+     col             = "#009E73",
+     lwd             = 2.5,
+     main            = paste("ROC Curve — Random Forest | AUC =",
+                             round(auc(roc_rf), 3)),
+     print.auc       = TRUE,
+     auc.polygon     = TRUE,
+     auc.polygon.col = "#009E7330")
+```
+
+---
+
+# Key Findings & Conclusions
+
+## Summary of Findings
+
+| Finding | Insight |
+|---|---|
+| Most wins | Mumbai Indians — 144 wins |
+| Best win rate | Gujarat Titans — 62.2% |
+| Toss impact | Only 50.8% — nearly random |
+| Fielding first preference | 64% of toss winners chose to field |
+| Top batsman | Virat Kohli — 8,014 runs |
+| Top bowler | YS Chahal — 205 wickets |
+| Most used venue | Eden Gardens — 77 matches |
+| Best model | Decision Tree — 55.50% accuracy |
+| Top feature | Win rate difference — Score 100 |
+
+## Model Performance Discussion
+
+The best model achieved **55.50% accuracy** using only pre-match
+features. While this may appear modest, it represents a meaningful
+improvement over the 50% baseline (random guessing) for the
+following reasons:
+
+- Cricket is inherently unpredictable — upsets are frequent
+- Only 11 pre-match features were used — no live ball-by-ball data
+- Professional cricket analytics systems use real-time data and
+  achieve 80–85% accuracy using in-match features like current
+  score and wickets fallen
+
+## Limitations
+
+1. **No live match data** — only pre-match features used
+2. **Venue name mismatches** — some newer venues not found
+   in dataset (e.g. Narendra Modi Stadium)
+3. **Retired teams** — Pune Warriors and Kochi Tuskers Kerala
+   have very few matches, affecting their win rate reliability
+4. **Team composition changes** — same team name across years
+   can have very different squads
+
+## Future Improvements
+
+1. Add **ball-by-ball live features** like powerplay score and
+   wickets to significantly improve accuracy
+2. Use **player availability** and recent form as features
+3. Apply **deep learning** models like LSTM for sequence-based
+   match prediction
+4. Build a **Shiny web app** for interactive match prediction
+
+---
+
+# Conclusion
+
+This project successfully performed end-to-end IPL data analysis
+covering data loading, cleaning, exploratory analysis, feature
+engineering, and machine learning model building. Three models
+were trained and compared — Decision Tree emerged as the best
+performer with **55.50% accuracy**.
+
+The analysis revealed that **team historical strength** (win rate
+difference) and **venue familiarity** are the strongest predictors
+of match outcomes, while toss results have minimal impact. Virat
+Kohli and Yuzvendra Chahal stand out as the greatest individual
+performers in IPL history.
+
+The live match prediction function successfully predicts outcomes
+for any combination of IPL teams, providing probability scores
+alongside the predicted winner.
+
+---
+
+*Report generated using R `r getRversion()` |
+Subject: R for Data Science*
